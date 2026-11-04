@@ -1,10 +1,11 @@
 //! The desktop tools Claude calls: their definitions for tools/list and what each one does.
 //! Coordinates going in and out are pixels of the screenshot Claude saw, which may be scaled down
-//! from the monitor's real resolution; `View` converts between the two.
+//! from the monitor's real resolution; `View` converts between those and desktop coordinates.
 
 use crate::input::{self, Button, Combo};
-use crate::screen::{self, Monitor};
-use crate::window;
+use crate::screen::{self, Monitor, Rect};
+use crate::sys;
+use crate::window::{self, Window};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -12,7 +13,6 @@ use image::RgbImage;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use windows::Win32::Foundation::RECT;
 
 /// Longest image edge that reaches the model untouched. Requests with more than 20 images (any
 /// real session) only take images up to 2000x2000, and Claude Code shrinks bigger ones, which
@@ -25,6 +25,9 @@ const DEFAULT_MAX_PIXELS: f64 = 1920.0 * 1080.0;
 const MAX_ZOOM: f64 = 3.0;
 /// Time for the UI to react before the screenshot that follows an action.
 const SETTLE_MS: u64 = 500;
+/// How often, and how many times, to look for the window of an app that was just started.
+const LAUNCH_POLL_MS: u64 = 200;
+const LAUNCH_POLLS: u32 = 40;
 
 const STOPPED: &str = "STOPPED BY USER: the mouse pointer was pushed into a screen corner, which is the \
 emergency stop. Don't retry and don't continue the task: stop now and tell the user what you were doing.";
@@ -72,7 +75,7 @@ impl Part {
     }
 
     /// The sharpest part that shows all of `rect` (with some slack for window shadows).
-    fn showing(monitor: Monitor, rect: RECT) -> Self {
+    fn showing(monitor: Monitor, rect: Rect) -> Self {
         if !is_ultrawide(monitor) {
             return Part::Full;
         }
@@ -99,7 +102,7 @@ struct View {
     part: Part,
     /// The rectangle of the screen shown: a whole monitor or part of one.
     area: Monitor,
-    /// Screenshot pixels per screen pixel (at most 1).
+    /// Screenshot pixels per desktop coordinate (at most the monitor's density: no upscaling).
     scale: f64,
     width: u32,
     height: u32,
@@ -108,13 +111,13 @@ struct View {
 impl View {
     fn new(index: usize, monitor: Monitor, part: Part, max_pixels: f64) -> Self {
         let area = part.area(monitor);
-        let scale = budget_scale(area.width, area.height, max_pixels).min(1.0);
+        let scale = budget_scale(area.width, area.height, max_pixels).min(area.density);
         let width = (area.width as f64 * scale).round() as u32;
         let height = (area.height as f64 * scale).round() as u32;
         Self { index, part, area, scale, width, height }
     }
 
-    /// The screen pixel under the center of screenshot pixel (x, y).
+    /// The desktop coordinates under the center of screenshot pixel (x, y).
     fn to_screen(self, x: f64, y: f64) -> Result<(i32, i32)> {
         // Written so NaN fails too.
         if !(x >= 0.0 && x < self.width as f64 && y >= 0.0 && y < self.height as f64) {
@@ -130,6 +133,11 @@ impl View {
         self.area.contains(x, y).then(|| {
             (((x - self.area.left) as f64 * self.scale) as u32, ((y - self.area.top) as f64 * self.scale) as u32)
         })
+    }
+
+    /// How much of the monitor's real resolution the screenshot keeps, up to 1.
+    fn sharpness(self) -> f64 {
+        self.scale / self.area.density
     }
 
     fn describe(self) -> String {
@@ -158,7 +166,8 @@ impl Desktop {
             .and_then(|v| v.parse().ok())
             .filter(|pixels| (300_000.0..=3_750_000.0).contains(pixels))
             .unwrap_or(DEFAULT_MAX_PIXELS);
-        Self { max_pixels, monitor: 0, part: Part::Full, shown: None, pointer: None }
+        let monitor = screen::monitors().ok().and_then(|monitors| monitors.iter().position(|m| m.primary)).unwrap_or(0);
+        Self { max_pixels, monitor, part: Part::Full, shown: None, pointer: None }
     }
 
     /// Runs one tool and returns the MCP tools/call result.
@@ -181,7 +190,7 @@ impl Desktop {
             "screenshot" => {
                 let args: ScreenshotArgs = parse(args)?;
                 if let Some(index) = args.monitor {
-                    let count = screen::monitors().len();
+                    let count = screen::monitors()?.len();
                     if index >= count {
                         bail!("there is no monitor {index}; monitors are numbered 0 to {}", count - 1);
                     }
@@ -196,13 +205,13 @@ impl Desktop {
                 self.screenshot("")
             }
             "zoom" => self.zoom(parse(args)?),
-            "list_windows" => Ok(vec![text(self.windows_report())]),
+            "list_windows" => Ok(vec![text(self.windows_report()?)]),
             action => {
                 let want_screenshot = args.get("screenshot").and_then(Value::as_bool).unwrap_or(true);
                 self.check_stop()?;
                 let done = self.act(action, args);
                 // Remember where we left the pointer even when the action failed half-way.
-                self.pointer = Some(input::cursor());
+                self.pointer = input::cursor().ok();
                 let note = done?;
                 if want_screenshot {
                     input::pause(SETTLE_MS);
@@ -274,29 +283,47 @@ impl Desktop {
             "focus_window" => {
                 let args: FocusWindowArgs = parse(args)?;
                 let window = window::focus(&args.title)?;
-                let mut note = format!("Focused {}.", window.label());
-                // Follow the window so the next screenshot shows it, as sharp as possible.
-                let monitors = screen::monitors();
-                if let Some(index) = monitor_of(&monitors, window.rect) {
-                    let part = Part::showing(monitors[index], window.rect);
-                    if (index, part) != (self.monitor, self.part) {
-                        (self.monitor, self.part) = (index, part);
-                        note += &format!(" Screenshots now show {}.", self.view()?.describe());
+                Ok(format!("Focused {}.{}", window.label(), self.follow(&window)?))
+            }
+            "launch_app" => {
+                let args: LaunchAppArgs = parse(args)?;
+                let before: Vec<_> = window::list()?.into_iter().map(|w| w.id).collect();
+                let name = sys::launch(&args.name)?;
+                for _ in 0..LAUNCH_POLLS {
+                    input::pause(LAUNCH_POLL_MS);
+                    if let Some(window) = window::list()?.into_iter().find(|w| !before.contains(&w.id)) {
+                        return Ok(format!("Started {}.{}", window.label(), self.follow(&window)?));
                     }
                 }
-                Ok(note)
+                Ok(format!(
+                    "Started {name}, but no new window has appeared. It may still be loading, or have reused a window that was already open: check list_windows."
+                ))
             }
             other => bail!("unknown tool {other:?}"),
         }
     }
 
+    /// Makes the next screenshot show `window`, as sharp as possible, and says so if that's new.
+    fn follow(&mut self, window: &Window) -> Result<String> {
+        let monitors = screen::monitors()?;
+        if let Some(index) = monitor_of(&monitors, window.rect) {
+            let part = Part::showing(monitors[index], window.rect);
+            if (index, part) != (self.monitor, self.part) {
+                (self.monitor, self.part) = (index, part);
+                return Ok(format!(" Screenshots now show {}.", self.view()?.describe()));
+            }
+        }
+        Ok(String::new())
+    }
+
     /// The emergency stop: the user pushed the pointer into a screen corner (and we didn't).
     fn check_stop(&self) -> Result<()> {
-        let (x, y) = input::cursor();
+        // Not knowing where the pointer is counts as a failure: the stop has to be able to work.
+        let (x, y) = input::cursor()?;
         if self.pointer == Some((x, y)) {
             return Ok(());
         }
-        if screen::monitors().iter().any(|m| m.is_corner(x, y)) {
+        if screen::monitors()?.iter().any(|m| m.is_corner(x, y)) {
             bail!(STOPPED);
         }
         Ok(())
@@ -304,7 +331,7 @@ impl Desktop {
 
     /// The view the next screenshot will have.
     fn view(&self) -> Result<View> {
-        let monitors = screen::monitors();
+        let monitors = screen::monitors()?;
         let index = if self.monitor < monitors.len() { self.monitor } else { 0 };
         let monitor = *monitors.get(index).context("no monitors found")?;
         Ok(View::new(index, monitor, self.part, self.max_pixels))
@@ -329,13 +356,13 @@ impl Desktop {
         let (image, view) = self.capture()?;
         let block = jpeg_block(&image)?;
         self.shown = Some(view);
-        let (x, y) = input::cursor();
+        let (x, y) = input::cursor()?;
         let pointer = match view.to_image(x, y) {
             Some((x, y)) => format!("at ({x}, {y})"),
             None => "outside this screenshot".into(),
         };
-        let scaled = if view.scale < 1.0 {
-            format!(", scaled to {:.0}% (zoom in to read small text)", view.scale * 100.0)
+        let scaled = if view.sharpness() < 1.0 {
+            format!(", scaled to {:.0}% (zoom in to read small text)", view.sharpness() * 100.0)
         } else {
             String::new()
         };
@@ -346,7 +373,7 @@ impl Desktop {
             view.height,
             window::foreground_label()
         );
-        let monitors = screen::monitors();
+        let monitors = screen::monitors()?;
         if monitors.len() > 1 {
             let list: Vec<String> = monitors
                 .iter()
@@ -358,7 +385,7 @@ impl Desktop {
         if let Some(&monitor) = monitors.get(view.index)
             && is_ultrawide(monitor)
         {
-            let sharper = View::new(view.index, monitor, Part::Center, self.max_pixels).scale;
+            let sharper = View::new(view.index, monitor, Part::Center, self.max_pixels).sharpness();
             summary += &format!(
                 " Monitor {} is ultrawide: pass part \"left\", \"center\" or \"right\" to screenshot to see a 16:9 slice of it at {:.0}%, or \"full\" for all of it.",
                 view.index,
@@ -381,7 +408,7 @@ impl Desktop {
         let right = (a.left + ((args.x + args.width) / view.scale).ceil() as i32).min(a.left + a.width);
         let bottom = (a.top + ((args.y + args.height) / view.scale).ceil() as i32).min(a.top + a.height);
         let (width, height) = ((right - left).max(1), (bottom - top).max(1));
-        let factor = budget_scale(width, height, self.max_pixels).min(MAX_ZOOM);
+        let factor = budget_scale(width, height, self.max_pixels).min(MAX_ZOOM * a.density);
         let size = |n: i32| ((n as f64 * factor).round() as u32).max(1);
         let image = screen::fit(screen::capture(left, top, width, height)?, size(width), size(height));
         let summary = format!(
@@ -395,22 +422,22 @@ impl Desktop {
         Ok(vec![text(summary), jpeg_block(&image)?])
     }
 
-    fn windows_report(&self) -> String {
-        let monitors = screen::monitors();
-        let foreground = window::foreground();
-        let lines: Vec<String> = window::list()
+    fn windows_report(&self) -> Result<String> {
+        let monitors = screen::monitors()?;
+        let foreground = window::foreground()?;
+        let lines: Vec<String> = window::list()?
             .iter()
             .map(|w| {
-                let place = match (w.minimized, monitor_of(&monitors, w.rect)) {
-                    (true, _) => "minimized".to_string(),
-                    (false, Some(index)) => format!("monitor {index}"),
-                    (false, None) => "off-screen".to_string(),
+                let place = match (&w.hidden, monitor_of(&monitors, w.rect)) {
+                    (Some(why), _) => why.clone(),
+                    (None, Some(index)) => format!("monitor {index}"),
+                    (None, None) => "off-screen".to_string(),
                 };
-                let active = if w.handle == foreground { ", active" } else { "" };
+                let active = if Some(w.id) == foreground { ", active" } else { "" };
                 format!("- {}: {place}{active}", w.label())
             })
             .collect();
-        if lines.is_empty() { "No open windows.".into() } else { format!("Open windows, frontmost first:\n{}", lines.join("\n")) }
+        Ok(if lines.is_empty() { "No open windows.".into() } else { format!("Open windows, frontmost first:\n{}", lines.join("\n")) })
     }
 }
 
@@ -433,7 +460,7 @@ fn budget_scale(width: i32, height: i32, max_pixels: f64) -> f64 {
 }
 
 /// The monitor holding the center of `rect`.
-fn monitor_of(monitors: &[Monitor], rect: RECT) -> Option<usize> {
+fn monitor_of(monitors: &[Monitor], rect: Rect) -> Option<usize> {
     let (x, y) = ((rect.left + rect.right) / 2, (rect.top + rect.bottom) / 2);
     monitors.iter().position(|m| m.contains(x, y))
 }
@@ -517,6 +544,11 @@ struct FocusWindowArgs {
     title: String,
 }
 
+#[derive(Deserialize)]
+struct LaunchAppArgs {
+    name: String,
+}
+
 /// The tool list for tools/list.
 pub fn definitions() -> Value {
     let coordinate = |what: &str| json!({ "type": "number", "description": format!("{what}, in screenshot pixels.") });
@@ -526,12 +558,12 @@ pub fn definitions() -> Value {
         "description": "Return a screenshot after the action (default true). Pass false when chaining steps whose result you don't need to see."
     });
     let read_only = json!({ "readOnlyHint": true });
-    json!([
+    let mut tools = json!([
         {
             "name": "screenshot",
             "description": "Capture the current monitor, mouse pointer included. Coordinates in every other tool are pixels of this image. With several monitors, pass monitor to switch.",
             "inputSchema": { "type": "object", "properties": {
-                "monitor": { "type": "integer", "minimum": 0, "description": "Monitor to show from now on (0 = primary)." },
+                "monitor": { "type": "integer", "minimum": 0, "description": "Monitor to show from now on, numbered as each screenshot lists them." },
                 "part": {
                     "type": "string",
                     "enum": ["full", "left", "center", "right"],
@@ -605,7 +637,7 @@ pub fn definitions() -> Value {
         },
         {
             "name": "press_keys",
-            "description": "Press a key or key combination, e.g. \"enter\", \"esc\", \"ctrl+s\", \"alt+tab\", \"win+r\", \"ctrl+shift+t\", \"f5\", \"pagedown\".",
+            "description": "Press a key or key combination, e.g. \"enter\", \"esc\", \"ctrl+s\", \"alt+tab\", \"win+r\" (win is the Super key on Linux), \"ctrl+shift+t\", \"f5\", \"pagedown\".",
             "inputSchema": { "type": "object", "properties": {
                 "keys": { "type": "string" },
                 "repeat": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Press it this many times. Default 1." },
@@ -628,11 +660,72 @@ pub fn definitions() -> Value {
         },
         {
             "name": "focus_window",
-            "description": "Bring a window to the front by (part of) its title or its app name (e.g. \"notepad\"), restoring it if minimized. Screenshots follow it to its monitor.",
+            "description": "Bring a window to the front by (part of) its title or its app name (e.g. \"firefox\"), restoring it if it's minimized or on another workspace. Screenshots follow it to its monitor.",
             "inputSchema": { "type": "object", "properties": {
                 "title": { "type": "string" },
                 "screenshot": screenshot_after
             }, "required": ["title"] }
         }
-    ])
+    ]);
+    if sys::HAS_LAUNCHER
+        && let Some(list) = tools.as_array_mut()
+    {
+        list.push(json!({
+            "name": "launch_app",
+            "description": "Open an installed app, the way its entry in an applications menu would. This is how to start apps here: there may be no menu to click, and guessing at shortcuts rarely works. Takes a name, not a command line. Waits for the app's window, and screenshots follow it to its monitor.",
+            "inputSchema": { "type": "object", "properties": {
+                "name": { "type": "string", "description": "The app's name (\"firefox\") or kind (\"web browser\", \"text editor\", \"terminal\")." },
+                "screenshot": screenshot_after
+            }, "required": ["name"] }
+        }));
+    }
+    tools
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn monitor(width: i32, height: i32, density: f64) -> Monitor {
+        Monitor { left: 100, top: 0, width, height, primary: true, density }
+    }
+
+    #[test]
+    fn a_plain_monitor_within_budget_maps_one_to_one() {
+        let view = View::new(0, monitor(1600, 900, 1.0), Part::Full, DEFAULT_MAX_PIXELS);
+        assert_eq!((view.width, view.height), (1600, 900));
+        assert_eq!(view.to_screen(10.0, 20.0).unwrap(), (110, 20));
+        assert_eq!(view.sharpness(), 1.0);
+    }
+
+    #[test]
+    fn a_scaled_monitor_shows_its_real_pixels_but_clicks_in_desktop_coordinates() {
+        // 1920x1200 real pixels at 1.5 are 1280x800 desktop coordinates.
+        let view = View::new(0, monitor(1280, 800, 1.5), Part::Full, 1920.0 * 1200.0);
+        assert_eq!((view.width, view.height), (1920, 1200));
+        assert_eq!(view.sharpness(), 1.0);
+        assert_eq!(view.to_screen(1919.0, 1199.0).unwrap(), (100 + 1279, 799));
+        assert_eq!(view.to_image(100 + 640, 400), Some((960, 600)));
+    }
+
+    #[test]
+    fn a_monitor_never_scales_up_past_its_density() {
+        let view = View::new(0, monitor(1280, 800, 1.0), Part::Full, DEFAULT_MAX_PIXELS);
+        assert_eq!((view.width, view.height), (1280, 800));
+    }
+
+    #[test]
+    fn budget_shrinks_a_big_monitor_and_sharpness_reports_it() {
+        let view = View::new(0, monitor(3840, 2160, 1.0), Part::Full, DEFAULT_MAX_PIXELS);
+        assert_eq!(view.width, 1920);
+        assert_eq!(view.sharpness(), 0.5);
+        assert_eq!(view.to_screen(960.0, 540.0).unwrap(), (100 + 1921, 1081));
+    }
+
+    #[test]
+    fn rejects_coordinates_outside_the_screenshot() {
+        let view = View::new(0, monitor(1600, 900, 1.0), Part::Full, DEFAULT_MAX_PIXELS);
+        assert!(view.to_screen(1600.0, 0.0).is_err());
+        assert!(view.to_screen(f64::NAN, 0.0).is_err());
+    }
 }

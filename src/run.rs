@@ -15,15 +15,19 @@ summary of what you did.";
 
 pub fn run(task: &str) -> Result<()> {
     let exe = std::env::current_exe().context("couldn't find this program's own path")?;
+    // Given inline, not as a file: the temp directory is shared on Linux, and whoever could swap a
+    // file there would choose the command claude runs.
     let config = json!({ "mcpServers": { "desktop": { "type": "stdio", "command": exe, "args": ["serve"] } } });
-    let config_path = std::env::temp_dir().join("takeovermydeskop-mcp.json");
-    std::fs::write(&config_path, config.to_string())?;
 
     let bin = std::env::var("TAKEOVER_CLAUDE_BIN").unwrap_or_else(|_| "claude".into());
     let mut child = Command::new(&bin)
         .args(["-p", "--output-format", "stream-json", "--verbose", "--strict-mcp-config"])
         .arg("--mcp-config")
-        .arg(&config_path)
+        .arg(config.to_string())
+        // Takes away Claude Code's own tools. Nobody is watching, and what's on the screen can try
+        // to steer Claude; --allowedTools alone wouldn't help, since it only adds to what the
+        // user's permissions already allow.
+        .args(["--tools", ""])
         // Approves the desktop tools without prompting; nobody is there to answer a prompt.
         .args(["--allowedTools", "mcp__desktop"])
         .args(["--append-system-prompt", UNATTENDED])

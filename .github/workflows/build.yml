@@ -7,12 +7,24 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: takeovermydeskop.exe
+            # Link the C runtime statically so the .exe runs without the Visual C++ redistributable.
+            rustflags: -C target-feature=+crt-static
+          - os: ubuntu-latest
+            # musl links everything statically, so the binary runs on any distribution.
+            target: x86_64-unknown-linux-musl
+            binary: takeovermydeskop
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     env:
-      # Link the C runtime statically so the .exe runs without the Visual C++ redistributable.
-      RUSTFLAGS: -C target-feature=+crt-static
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       - uses: actions/checkout@v7
 
@@ -22,23 +34,30 @@ jobs:
         run: grep -qx "version = \"${GITHUB_REF_NAME#v}\"" Cargo.toml || { echo "Tag $GITHUB_REF_NAME doesn't match the version in Cargo.toml"; exit 1; }
 
       - name: Update Rust
-        run: rustup update stable --no-self-update && rustup default stable
+        run: rustup update stable --no-self-update && rustup default stable && rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Test
+        run: cargo test --locked --target ${{ matrix.target }}
+
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - uses: actions/upload-artifact@v7
         with:
-          name: takeovermydeskop
-          path: target/release/takeovermydeskop.exe
+          name: takeovermydeskop-${{ runner.os }}
+          path: target/${{ matrix.target }}/release/${{ matrix.binary }}
 
-      # Pushing a tag like v0.1.0 publishes the .exe, and a zip of it with the README and license,
-      # on that tag's GitHub release.
-      - name: Package
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: Compress-Archive -Path target/release/takeovermydeskop.exe, README.md, LICENSE -DestinationPath "takeovermydeskop-$env:GITHUB_REF_NAME-windows-x64.zip"
+      # Pushing a tag like v0.1.0 publishes each binary, and an archive of it with the README and
+      # license, on that tag's GitHub release.
+      - name: Package for Windows
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Windows'
+        run: Compress-Archive -Path target/${{ matrix.target }}/release/${{ matrix.binary }}, README.md, LICENSE -DestinationPath "takeovermydeskop-$env:GITHUB_REF_NAME-windows-x64.zip"
+
+      - name: Package for Linux
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Linux'
+        run: tar -czf "takeovermydeskop-$GITHUB_REF_NAME-linux-x64.tar.gz" README.md LICENSE -C target/${{ matrix.target }}/release ${{ matrix.binary }}
 
       - name: Attach to release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -46,5 +65,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes
-          gh release upload "$GITHUB_REF_NAME" target/release/takeovermydeskop.exe "takeovermydeskop-$GITHUB_REF_NAME-windows-x64.zip" --clobber
+          # Both jobs get here, and the one that loses the race to create the release just uses it.
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 || gh release create "$GITHUB_REF_NAME" --generate-notes || gh release view "$GITHUB_REF_NAME" > /dev/null
+          gh release upload "$GITHUB_REF_NAME" "target/${{ matrix.target }}/release/${{ matrix.binary }}" takeovermydeskop-"$GITHUB_REF_NAME"-* --clobber
