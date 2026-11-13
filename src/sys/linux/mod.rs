@@ -10,13 +10,11 @@ mod x11;
 
 use crate::input::{Button, Key, Wheel};
 use crate::screen::Monitor;
-use crate::window::Window;
+use crate::window::{Launched, Window};
 use anyhow::{Result, bail};
 use image::RgbImage;
 use std::cell::RefCell;
 use std::env;
-
-pub use apps::launch;
 
 /// A key as the backend knows it: an evdev code on Wayland, a keycode on X11.
 pub type KeyCode = u32;
@@ -28,6 +26,17 @@ pub const LIMITS: &str = "A locked screen, and apps that grab the keyboard or th
 
 /// Whether `launch_app` is offered.
 pub const HAS_LAUNCHER: bool = true;
+
+/// `launch_app`'s description, and its `name` argument's.
+pub const LAUNCH_APP: (&str, &str) = (
+    "Open an installed app, the way its entry in an applications menu would. This is how to start apps here: there may be no menu to click, and guessing at shortcuts rarely works. Takes a name, not a command line. Waits for the app's window, and screenshots follow it to its monitor.",
+    "The app's name (\"firefox\") or kind (\"web browser\", \"text editor\", \"terminal\").",
+);
+
+/// Starts an app from its desktop entry. The caller waits for its window.
+pub fn launch(app: &str, _check_stop: &(dyn Fn() -> Result<()> + Sync)) -> Result<Launched> {
+    apps::launch(app).map(Launched::Started)
+}
 
 trait Backend {
     /// Monitors in a fixed order, with the one to start on marked primary.

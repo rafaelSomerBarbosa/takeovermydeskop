@@ -36,8 +36,25 @@ pub fn focus(query: &str) -> Result<Window> {
         .or_else(|| windows.iter().find(|w| w.title.to_lowercase().contains(&query)))
         .or_else(|| windows.iter().find(app));
     let Some(window) = found else {
-        bail!("no open window matches {query:?}; call list_windows to see what's open");
+        let launcher = if sys::HAS_LAUNCHER { ", or launch_app to start the app" } else { "" };
+        bail!("no open window matches {query:?}; call list_windows to see what's open{launcher}");
     };
+    activate(window)
+}
+
+/// What `sys::launch` did.
+pub enum Launched {
+    /// Started the app called this. Its window is still to come. (Linux)
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    Started(String),
+    /// Saw to the app's window itself: a note on what happened, and the window when it's now in
+    /// front. (Windows)
+    #[cfg_attr(not(windows), allow(dead_code))]
+    Shown(String, Option<Window>),
+}
+
+/// Brings `window` to the front, restoring it if it's minimized, and returns it as it is then.
+pub fn activate(window: &Window) -> Result<Window> {
     sys::activate(window)?;
     input::pause(150);
     if foreground()? != Some(window.id) {

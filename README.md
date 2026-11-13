@@ -58,7 +58,7 @@ Push the mouse pointer into any corner of a screen. The next action Claude tries
 | `press_keys` | Shortcuts like `ctrl+s`, `alt+tab`, `win+r` (`win` is the Super key on Linux), with `repeat` |
 | `wait` | Waits, then takes a screenshot |
 | `list_windows`, `focus_window` | Open windows, and bringing one to the front by title or app name |
-| `launch_app` | Linux only: opens an installed app by name or kind (`firefox`, `text editor`), as an applications menu would. It takes no command line, and only sees apps a menu would list |
+| `launch_app` | Opens an installed app by name, as the Start menu or an applications menu would. It takes no command line, and only sees apps a menu would list. On Windows it also brings back apps hidden in the system tray (WhatsApp, Discord...), which no window tool can reach, and brings an app that's already open to the front instead of opening another. On Linux it also takes a kind (`text editor`) |
 
 Action tools return a screenshot afterwards unless they're called with `screenshot: false`.
 

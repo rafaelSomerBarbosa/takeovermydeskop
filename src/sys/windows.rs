@@ -7,7 +7,7 @@ use crate::screen::{Monitor, Rect};
 use crate::window::Window;
 use anyhow::{Result, anyhow, bail};
 use image::RgbImage;
-use windows::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, POINT, RECT};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap, CreateCompatibleDC,
@@ -34,8 +34,19 @@ pub type WindowId = HWND;
 /// What Claude can't reach on this platform, for its instructions.
 pub const LIMITS: &str = "Windows ignores this input in UAC prompts, on the lock screen and in apps running as administrator; ask the user to handle those.";
 
-/// Whether `launch_app` is offered. Windows always has a Start menu to click.
-pub const HAS_LAUNCHER: bool = false;
+/// Whether `launch_app` is offered. Windows has a Start menu to click, but `launch_app` also
+/// reaches apps hidden in the system tray, which nothing on screen does.
+pub const HAS_LAUNCHER: bool = true;
+
+/// `launch_app`'s description, and its `name` argument's.
+pub const LAUNCH_APP: (&str, &str) = (
+    "Open an app by its Start menu name (e.g. \"WhatsApp\", \"Calculator\"), as clicking it in the Start menu would. This also brings back an app that's running hidden in the system tray or on another virtual desktop, which no window tool can reach. If a window of the app is already on screen, that one comes to the front instead of a new one opening. Takes a name, not a command line. Waits up to 15 s for the app's window, and screenshots follow it to its monitor.",
+    "The app's name as the Start menu shows it (\"WhatsApp\"); part of it works too.",
+);
+
+#[path = "windows/apps.rs"]
+mod apps;
+pub use apps::launch;
 
 const MONITORINFOF_PRIMARY: u32 = 1;
 /// One click of the mouse wheel (WHEEL_DELTA).
@@ -336,10 +347,6 @@ fn send(inputs: &[INPUT]) -> Result<()> {
     Ok(())
 }
 
-pub fn launch(_app: &str) -> Result<String> {
-    bail!("launch_app isn't available on Windows; use the Start menu")
-}
-
 /// Visible, titled windows from the frontmost back, roughly what Alt+Tab shows.
 pub fn list() -> Result<Vec<Window>> {
     unsafe extern "system" fn collect(handle: HWND, list: LPARAM) -> BOOL {
@@ -418,20 +425,28 @@ fn title(handle: HWND) -> String {
 }
 
 fn app_name(handle: HWND) -> String {
+    program_path(handle).and_then(|path| path.rsplit('\\').next().map(str::to_string)).unwrap_or_default()
+}
+
+/// Full path of the program running `handle`, e.g. C:\Program Files\App\app.exe.
+fn program_path(handle: HWND) -> Option<String> {
+    with_process(handle, |process| {
+        let mut buffer = [0u16; 1024];
+        let mut len = buffer.len() as u32;
+        unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut len) }.ok()?;
+        Some(String::from_utf16_lossy(&buffer[..len as usize]))
+    })
+}
+
+/// Runs `read` on the process that owns `handle`, if Windows lets us look at it (it doesn't for
+/// apps running as administrator).
+fn with_process<T>(handle: HWND, read: impl FnOnce(HANDLE) -> Option<T>) -> Option<T> {
     let mut pid = 0;
     unsafe { GetWindowThreadProcessId(handle, Some(&mut pid)) };
-    let Ok(process) = (unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }) else {
-        return String::new();
-    };
-    let mut buffer = [0u16; 1024];
-    let mut len = buffer.len() as u32;
-    let found = unsafe { QueryFullProcessImageNameW(process, PROCESS_NAME_WIN32, PWSTR(buffer.as_mut_ptr()), &mut len) };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let result = read(process);
     unsafe {
         let _ = CloseHandle(process);
     }
-    if found.is_err() {
-        return String::new();
-    }
-    let path = String::from_utf16_lossy(&buffer[..len as usize]);
-    path.rsplit('\\').next().unwrap_or_default().to_string()
+    result
 }

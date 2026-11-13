@@ -5,7 +5,7 @@
 use crate::input::{self, Button, Combo};
 use crate::screen::{self, Monitor, Rect};
 use crate::sys;
-use crate::window::{self, Window};
+use crate::window::{self, Launched, Window};
 use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -288,7 +288,17 @@ impl Desktop {
             "launch_app" => {
                 let args: LaunchAppArgs = parse(args)?;
                 let before: Vec<_> = window::list()?.into_iter().map(|w| w.id).collect();
-                let name = sys::launch(&args.name)?;
+                let launched = sys::launch(&args.name, &|| self.check_stop())?;
+                let name = match launched {
+                    Launched::Started(name) => name,
+                    Launched::Shown(note, window) => {
+                        let follow = match window {
+                            Some(window) => self.follow(&window)?,
+                            None => String::new(),
+                        };
+                        return Ok(format!("{note}{follow}"));
+                    }
+                };
                 for _ in 0..LAUNCH_POLLS {
                     input::pause(LAUNCH_POLL_MS);
                     if let Some(window) = window::list()?.into_iter().find(|w| !before.contains(&w.id)) {
@@ -670,11 +680,12 @@ pub fn definitions() -> Value {
     if sys::HAS_LAUNCHER
         && let Some(list) = tools.as_array_mut()
     {
+        let (description, name) = sys::LAUNCH_APP;
         list.push(json!({
             "name": "launch_app",
-            "description": "Open an installed app, the way its entry in an applications menu would. This is how to start apps here: there may be no menu to click, and guessing at shortcuts rarely works. Takes a name, not a command line. Waits for the app's window, and screenshots follow it to its monitor.",
+            "description": description,
             "inputSchema": { "type": "object", "properties": {
-                "name": { "type": "string", "description": "The app's name (\"firefox\") or kind (\"web browser\", \"text editor\", \"terminal\")." },
+                "name": { "type": "string", "description": name },
                 "screenshot": screenshot_after
             }, "required": ["name"] }
         }));
